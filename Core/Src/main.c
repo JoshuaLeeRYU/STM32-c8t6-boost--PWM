@@ -22,8 +22,8 @@
 #include "dma.h"
 #include "gpio.h"
 #include "i2c.h"
-#include "stm32f1xx_hal.h"
 #include "tim.h"
+
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -50,12 +50,17 @@
 #define UMIN 5.0
 #define UMAX 16.0
 #define IMIN 0.0
-#define IMAX 1.0
+#define IMAX 0.4
 #define XZMAX 10.0
 #define DELTA_U 0.01 // 误差
 #define DELTA_I -0.006
-#define vKp1 1.5
-#define vKi1 4
+#define vkp 0.5
+#define vki 4
+#define akp 3
+#define aki 500
+#define I_HYST 0.01f
+#define U_HYST 0.05f
+#define CURRENT_LPF 0.2f
 
 /* USER CODE END PD */
 
@@ -73,8 +78,6 @@ volatile float current = 0.0;
 volatile int key = 0;
 volatile int clcflag = 0;
 volatile int showoled = 0;
-float vkp = 1.5, vki = 4;
-float akp = 3, aki = 500;
 float vP = 0, vI = 0, vintegral = 0;
 float aP = 0, aI = 0, aintegral = 0;
 float vduty = 0.02, aduty = 0.0;
@@ -82,6 +85,8 @@ float targeta1, targetv1, xz1;
 float b = 0.0;
 float xz = 0;
 float INA219_voltage = 0, INA219_current = 0;
+float current_f = 0.0f;
+float voltage_f = 0.0f;
 char V[20], A[20], MODE[20], XZ[20];
 char a0[3] = {'='}, a1[3] = {'<'};
 int d = 0;
@@ -90,6 +95,8 @@ int counter = 0;
 int inited = 0;
 int mode = 0;
 int ready = 0;
+int i = 0;
+int limit_active = 0;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -164,7 +171,7 @@ int main(void) {
   OLED_NewFrame();
   OLED_DrawImage(0, 0, &MeguminImg, OLED_COLOR_NORMAL);
   OLED_PrintString(64, 8, "可调电源", &font16x16, OLED_COLOR_NORMAL);
-  OLED_PrintString(64, 24, "0-1A", &font16x16, OLED_COLOR_NORMAL);
+  OLED_PrintString(64, 24, "0-0.4A", &font16x16, OLED_COLOR_NORMAL);
   OLED_PrintString(64, 40, "5-16V", &font16x16, OLED_COLOR_NORMAL); // 启动画面
   OLED_ShowFrame();
 
@@ -192,22 +199,26 @@ int main(void) {
     }
 
     INA219_voltage = INA219_ReadBusVoltage() / 1000.0f;
-    INA219_current = (INA219_ReadCurrent() *0.4/32768); // 电流电压计算
-
+    INA219_current = (INA219_ReadCurrent() * 0.4 / 32768); // 电流电压计算
 
     if (INA219_voltage == 65535 / 1000.0f ||
         INA219_current == 65535 / 1000.0f) {
       OLED_NewFrame();
       OLED_PrintString(0, 0, "ERR", &font16x16, OLED_COLOR_NORMAL);
       OLED_ShowFrame();
-      continue; // 读取失败，跳过本循环
+      i++;
+      if (i > 1000) {
+        i = 0;
+        ina219_err = INA219_Init();
+      }
+      continue; // 读取失败，超过10次重新尝试初始化，跳过本循环
     }
     current = INA219_current + DELTA_I;
     voltage = INA219_voltage - current * xz +
               DELTA_U; // 电压电流赋值，线阻压降和INA219的误差补偿
 
     static uint32_t stable_start = 0;
-    if (fabsf(voltage - targetv) < 0.005) {
+    if (fabsf(voltage - targetv) < 0.02) {
       if (stable_start == 0) {
         stable_start = HAL_GetTick();
       } else if (HAL_GetTick() - stable_start >= 100) {
@@ -220,34 +231,100 @@ int main(void) {
     if (clcflag == 1) {
       clcflag = 0;
 
-      const float dt = 0.0001f;
-      // PI 控制V
-      if (!(vduty >= DUTY_MAX && (targetv - voltage) > 0) &&
-          !(vduty <= DUTY_MIN && (targetv - voltage) < 0)) {
-        vintegral += (targetv - voltage) * dt; // 防积分饱和
-      }
-      vP = vkp * (targetv - voltage);
-      vI = vki * vintegral;
-      vduty = vP + vI;
-      // PI 控制A
-      if (!(aduty >= DUTY_MAX && (targeta - current) > 0) &&
-          !(aduty <= DUTY_MIN && (targeta - current) < 0)) {
-        aintegral += (targeta - current) * dt; // 防积分饱和
-      }
-      aP = akp * (targeta - current);
-      aI = aki * aintegral;
-      aduty = aP + aI;
+      const float dt = 0.001f;
 
-      // 恒压限流
+      vP = vkp * (targetv - voltage);
+      aP = akp * (targeta - current);
+
+      // 迟滞判断
+      if (mode == 0) { // 恒压限流
+        if (!limit_active) {
+          if (current > targeta + I_HYST)
+            limit_active = 1;
+        } else {
+          if (current < targeta - I_HYST)
+            limit_active = 0;
+        }
+      } else { // 恒流限压
+        if (!limit_active) {
+          if (voltage > targetv + U_HYST)
+            limit_active = 1;
+        } else {
+          if (voltage < targetv - U_HYST)
+            limit_active = 0;
+        }
+      }
+
       if (mode == 0) {
-        b = vduty;
-        if (current > targeta && aduty < b)
-          b = aduty;
-        // 恒流限压
-      } else if (mode == 1) {
-        b = aduty;
-        if (voltage > targetv && vduty < b)
+        if (!limit_active) {
+          // 电压环工作，电流环跟踪 b
+          vintegral += (targetv - voltage) * dt;
+
+          float vint_max = (DUTY_MAX - vP) / vki;
+          float vint_min = (DUTY_MIN - vP) / vki;
+          if (vintegral > vint_max)
+            vintegral = vint_max;
+          if (vintegral < vint_min)
+            vintegral = vint_min;
+
+          vduty = vP + vki * vintegral;
           b = vduty;
+
+          // 电流环无扰跟踪
+          aintegral = (b - aP) / aki;
+          aduty = b;
+        } else {
+          // 电流环限流，电压环跟踪 b
+          aintegral += (targeta - current) * dt;
+
+          float aint_max = (DUTY_MAX - aP) / aki;
+          float aint_min = (DUTY_MIN - aP) / aki;
+          if (aintegral > aint_max)
+            aintegral = aint_max;
+          if (aintegral < aint_min)
+            aintegral = aint_min;
+
+          aduty = aP + aki * aintegral;
+          b = aduty;
+
+          // 电压环无扰跟踪
+          vintegral = (b - vP) / vki;
+          vduty = b;
+        }
+      } else { // mode == 1 恒流限压
+        if (!limit_active) {
+          // 电流环工作，电压环跟踪 b
+          aintegral += (targeta - current) * dt;
+
+          float aint_max = (DUTY_MAX - aP) / aki;
+          float aint_min = (DUTY_MIN - aP) / aki;
+          if (aintegral > aint_max)
+            aintegral = aint_max;
+          if (aintegral < aint_min)
+            aintegral = aint_min;
+
+          aduty = aP + aki * aintegral;
+          b = aduty;
+
+          vintegral = (b - vP) / vki;
+          vduty = b;
+        } else {
+          // 电压环限压，电流环跟踪 b
+          vintegral += (targetv - voltage) * dt;
+
+          float vint_max = (DUTY_MAX - vP) / vki;
+          float vint_min = (DUTY_MIN - vP) / vki;
+          if (vintegral > vint_max)
+            vintegral = vint_max;
+          if (vintegral < vint_min)
+            vintegral = vint_min;
+
+          vduty = vP + vki * vintegral;
+          b = vduty;
+
+          aintegral = (b - aP) / aki;
+          aduty = b;
+        }
       }
 
       if (b > DUTY_MAX)
@@ -328,6 +405,8 @@ int main(void) {
       }
       sprintf(V, "电压:%.2f%s%.2f", voltage, a0, targetv);
       OLED_PrintString(0, 0, V, &font16x16, page == 0);
+      if (current < 0)
+        current = 0;
       sprintf(A, "电流:%.2f%s%.2f", current, a1, targeta);
       OLED_PrintString(0, 16, A, &font16x16, page == 1);
       sprintf(XZ, "线阻Ω:%.1f", xz);
